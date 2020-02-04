@@ -263,6 +263,12 @@ private:
 	const char *category_;
 	const char *name_;
 };
+
+#ifdef MTR_DEAR_IMGUI
+// Dear ImGui based viewer
+void mtr_imgui_draw();
+#endif
+
 #endif
 
 #endif
