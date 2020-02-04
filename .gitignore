@@ -34,3 +34,15 @@ x64
 
 # Traces
 *.json
+
+# Build directories
+build*
+
+# Unneeded imgui code
+imgui/*
+
+# Unneeded glfw code
+glfw/*
+
+# ctags file
+tags
