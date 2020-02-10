@@ -413,333 +413,14 @@ void internal_mtr_raw_event_arg(const char *category, const char *name, char ph,
 // Flame graph type rendering of profile data using Dear Imgui
 #include "imgui.h"
 
+#define MAX_STACK_SIZE 128
+
 #ifdef _WIN32
 #include <windows.h>
 #define usleep(x) Sleep(x/1000)
 #else
 #include <unistd.h>
 #endif
-
-// Linked list for events
-//
-// Used for querying overlapping intervals.
-typedef struct IntrvlListNode {
-	raw_event* event;
-	struct IntrvlListNode *next;
-} IntrvlListNode;
-
-IntrvlListNode* IntrvlListNodeCreate () {
-	return (IntrvlListNode*) calloc (sizeof (IntrvlListNode), 1);
-}
-
-void IntrvlListNodeDestroy (IntrvlListNode* node) {
-	if (node == NULL) {
-		return;
-	}
-
-	IntrvlListNodeDestroy (node->next);
-	node->next = NULL;
-	free (node);
-}
-
-
-
-#define USE_AVL_TREE
-
-// Augmented Tree that allows querying for overlapping intervals
-//
-typedef struct IntrvlTreeNode {
-	struct IntrvlTreeNode *left;
-	struct IntrvlTreeNode *right;
-	raw_event* event;
-	int64_t max_upper;
-#ifdef USE_AVL_TREE
-	int height;
-#endif
-} IntrvlTreeNode;
-
-typedef struct IntrvlTreeNodeAllocNode {
-	struct IntrvlTreeNode* nodes;
-	struct IntrvlTreeNodeAllocNode* next;
-} IntrvlTreeNodeAllocNode;
-
-typedef struct IntrvlTreeNodeAllocData {
-	struct IntrvlTreeNodeAllocNode* blocks;
-	struct IntrvlTreeNodeAllocNode* cur_block;
-	int cur_idx;
-	int block_size;
-	int block_count;
-} IntrvlTreeNodeAllocData;
-
-static IntrvlTreeNodeAllocData intrvl_tree_node_alloc_data = { NULL, NULL, 0, 1024, 0 };
-
-IntrvlTreeNode* AllocIntrvlTreeNode () {
-	IntrvlTreeNodeAllocData* alloc_data = &intrvl_tree_node_alloc_data;
-
-	if (alloc_data->cur_block == NULL 
-			|| alloc_data->cur_idx == alloc_data->block_size) {
-		IntrvlTreeNodeAllocNode* new_block = (IntrvlTreeNodeAllocNode*) calloc (sizeof (IntrvlTreeNodeAllocNode), 1);
-		new_block->next = alloc_data->blocks;
-		alloc_data->blocks = new_block;
-		alloc_data->block_count++;
-
-		alloc_data->cur_block = new_block;
-		alloc_data->cur_block->nodes = (IntrvlTreeNode*) calloc (sizeof (IntrvlTreeNode), alloc_data->block_size);
-		alloc_data->cur_idx = 0;
-	}
-
-	return &alloc_data->cur_block->nodes[alloc_data->cur_idx++];
-}
-
-void AllocIntrvlDestroy () {
-	IntrvlTreeNodeAllocData* alloc_data = &intrvl_tree_node_alloc_data;
-	IntrvlTreeNodeAllocNode* alloc_node = alloc_data->blocks;
-
-	IntrvlTreeNodeAllocNode* temp_node = NULL;
-	while (alloc_node != NULL) {
-		temp_node = alloc_node->next;
-		free (alloc_node->nodes);
-		free (alloc_node);
-		alloc_node = temp_node;
-	}
-}
-
-IntrvlTreeNode* IntrvlTreeNodeCreate () {
-	IntrvlTreeNode* result = AllocIntrvlTreeNode();
-#ifdef USE_AVL_TREE
-	result->height = 1;
-#endif
-	return result;
-}
-
-void IntrvlTreeNodeDestroy (IntrvlTreeNode* node) {
-	if (node == NULL) {
-		return;
-	}
-
-	IntrvlTreeNodeDestroy (node->left);
-	node->left = NULL;
-
-	IntrvlTreeNodeDestroy (node->right);
-	node->right = NULL;
-
-	free (node);
-}
-
-#ifdef USE_AVL_TREE
-int IntrvlTreeNodeHeight (IntrvlTreeNode* node) {
-	if (node == NULL) {
-		return 0;
-	}
-	return node->height;
-}
-
-struct IntrvlTreeNode* IntrvlTreeRightRot (IntrvlTreeNode* z) {
-	struct IntrvlTreeNode* y = z->left;
-	struct IntrvlTreeNode* T2 = y->right;
-
-	y->right = z;
-	y->max_upper = y->event->ts + (int) y->event->a_double;
-
-	z->left = T2;
-	z->max_upper = z->event->ts + (int) z->event->a_double;
-
-	int y_left_height = IntrvlTreeNodeHeight(z->left);
-	int y_right_height = IntrvlTreeNodeHeight(z->right);
-	z->height = y_left_height > y_right_height + 1 ? y_left_height : y_right_height + 1;
-	if (z->left && z->left->max_upper > z->max_upper) {
-		z->max_upper = z->left->max_upper;
-	}
-	if (z->right && z->right->max_upper > z->max_upper) {
-		z->max_upper = z->right->max_upper;
-	}
-
-	int x_left_height = IntrvlTreeNodeHeight(y->left);
-	int x_right_height = IntrvlTreeNodeHeight(y->right);
-	y->height = x_left_height > x_right_height + 1 ? x_left_height : x_right_height + 1;
-	if (y->left && y->left->max_upper > y->max_upper) {
-		y->max_upper = y->left->max_upper;
-	}
-	if (y->right && y->right->max_upper > y->max_upper) {
-		y->max_upper = y->right->max_upper;
-	}
-
-	return y;
-}
-
-struct IntrvlTreeNode* IntrvlTreeLeftRot (IntrvlTreeNode* z) {
-	struct IntrvlTreeNode* y = z->right;
-	struct IntrvlTreeNode* T2 = y->left;
-
-	y->left = z;
-	y->max_upper = y->event->ts + (int) y->event->a_double;
-
-	z->right = T2;
-	z->max_upper = z->event->ts + (int) z->event->a_double;
-
-	int x_left_height = IntrvlTreeNodeHeight(z->left);
-	int x_right_height = IntrvlTreeNodeHeight(z->right);
-	z->height = x_left_height > x_right_height + 1 ? x_left_height : x_right_height + 1;
-	if (z->left && z->left->max_upper > z->max_upper) {
-		z->max_upper = z->left->max_upper;
-	}
-	if (z->right && z->right->max_upper > z->max_upper) {
-		z->max_upper = z->right->max_upper;
-	}
-
-	int y_left_height = IntrvlTreeNodeHeight(y->left);
-	int y_right_height = IntrvlTreeNodeHeight(y->right);
-	y->height = y_left_height > y_right_height + 1 ? y_left_height : y_right_height + 1;
-	if (y->left && y->left->max_upper > y->max_upper) {
-		y->max_upper = y->left->max_upper;
-	}
-	if (y->right && y->right->max_upper > y->max_upper) {
-		y->max_upper = y->right->max_upper;
-	}
-
-	return y;
-}
-
-struct IntrvlTreeNode* IntrvlTreeNodeAddEvent (IntrvlTreeNode* node, raw_event* event) {
-	if (node == NULL) {
-		node = IntrvlTreeNodeCreate();
-		node->max_upper = event->ts + (int64_t)event->a_double;
-		node->event = event;
-		node->height = 1;
-		return node;
-	}
-
-	if (event->ts < node->event->ts) {
-		node->left = IntrvlTreeNodeAddEvent (node->left, event);
-		if (node->left->max_upper > node->max_upper) {
-			node->max_upper = node->left->max_upper;
-		}
-	} else {
-		node->right = IntrvlTreeNodeAddEvent (node->right, event);
-		if (node->right->max_upper > node->max_upper) {
-			node->max_upper = node->right->max_upper;
-		}
-	}
-
-	int left_height = IntrvlTreeNodeHeight(node->left);
-	int right_height = IntrvlTreeNodeHeight(node->right);
-
-	node->height = 1 + (left_height > right_height ? left_height : right_height);
-	int balance = left_height - right_height;
-
-	if (balance > 1 && node->event->ts > node->left->event->ts) {
-		return IntrvlTreeRightRot(node);
-	}
-
-	if (balance < -1 && node->event->ts < node->right->event->ts) {
-		return IntrvlTreeLeftRot(node);
-	}
-
-	if (balance > 1 && node->event->ts < node->left->event->ts) {
-		node->left = IntrvlTreeLeftRot(node->left);
-		return IntrvlTreeRightRot(node);
-	}
-
-	if (balance < -1 && node->event->ts > node->right->event->ts) {
-		node->right = IntrvlTreeRightRot(node->right);
-		return IntrvlTreeLeftRot(node);
-	}
-
-	return node;
-}
-#else
-void IntrvlTreeNodeAddEvent (IntrvlTreeNode** node, raw_event* event) {
-	if (*node == NULL) {
-		*node = IntrvlTreeNodeCreate();
-		(*node)->max_upper = event->ts + (int64_t)event->a_double;
-		(*node)->event = event;
-	} else if (event->ts < (*node)->event->ts) {
-		IntrvlTreeNodeAddEvent (&(*node)->left, event);
-		if ((*node)->left->max_upper > (*node)->max_upper) {
-			(*node)->max_upper = (*node)->left->max_upper;
-		}
-	} else {
-		IntrvlTreeNodeAddEvent (&(*node)->right, event);
-		if ((*node)->right->max_upper > (*node)->max_upper) {
-			(*node)->max_upper = (*node)->right->max_upper;
-		}
-	}
-}
-#endif
-
-void IntrvlTreeNodeQuery (IntrvlTreeNode* node, int64_t start, int64_t end, IntrvlListNode* head) {
-	if (node == NULL) {
-		return;
-	}
-
-  if (node->event->ts <= end && node->event->ts + (int) node->event->a_double >= start) {
-		IntrvlListNode* list_node = IntrvlListNodeCreate();
-		list_node->next = head->next;
-		head->next = list_node;
-		list_node->event = node->event;
-	}
-
-	if (node->right && node->right->event->ts <= end) {
-    IntrvlTreeNodeQuery(node->right, start, end, head);
-  }
-
-	if (node->left && node->left->max_upper >= start) {
-	  IntrvlTreeNodeQuery (node->left, start, end, head);
-  }
-}
-
-int IntrvlTreeNodeCountEnclosing (IntrvlTreeNode* node, int64_t ts) {
-  if (node == NULL) {
-    return 0;
-  }
-
-  int interval_count = 0;
-
-  if (node->event->ts <= ts && node->event->ts + (int) node->event->a_double >= ts) {
-    interval_count = 1;
-  }
-
-  if (node->right && node->right->event->ts <= ts) {
-    interval_count += IntrvlTreeNodeCountEnclosing(node->right, ts);
-  }
-
-  if (node->left && node->left->max_upper >= ts) {
-    interval_count += IntrvlTreeNodeCountEnclosing(node->left, ts);
-  }
-
-  return interval_count;
-}
-
-void IntrvlTreeNodePrint (IntrvlTreeNode* node, uint64_t time_offset) {
-	if (node == NULL) {
-		printf ("Null");
-		return;
-	}
-
-	IntrvlTreeNodePrint (node->left, time_offset);
-
-	printf ("Event %s [%ld,%ld] height %d, max_upper %ld", node->event->name, node->event->ts - time_offset,
-			node->event->ts + (int) node->event->a_double - time_offset,
-			node->height,
-			node->max_upper - time_offset);
-
-	IntrvlTreeNodePrint (node->right, time_offset);
-}
-
-int IntrvlTreeNodeDepth (IntrvlTreeNode* node) {
-	if (node == NULL)
-		return 0;
-
-	int left_depth = 1 + IntrvlTreeNodeDepth (node->left);
-	int right_depth = 1 + IntrvlTreeNodeDepth (node->right);
-
-
-	return left_depth > right_depth ? left_depth : right_depth;
-}
-
-int CalcIntrvlDepth (raw_event* event, IntrvlTreeNode* tree_node) {
-  return IntrvlTreeNodeCountEnclosing (tree_node, event->ts) - 1;
-}
 
 void c() {
 	MTR_SCOPE("c++", "c()");
@@ -790,7 +471,7 @@ void generate_trace_data() {
 //		MTR_COUNTER("main", "greebles", 3 * i + 10);
 //	}
 
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < 40000; i++) {
 		MTR_BEGIN("main", "inner");
 		a();
 		usleep(10);
@@ -798,15 +479,15 @@ void generate_trace_data() {
 		usleep(20);
 //		MTR_COUNTER("main", "greebles", 3 * i + 10);
 	}
+  MTR_BEGIN ("main", "tinyblock");
+	for (i = 0; i < 10000; i++) {
+		MTR_BEGIN("main", "tiny");
+		usleep(200);
+		MTR_END("main", "tiny");
+		usleep(100);
+	}
+  MTR_END ("main", "tinyblock");
 
-	//    MTR_BEGIN ("main", "tinyblock");
-//	for (i = 0; i < 3; i++) {
-//		MTR_BEGIN("main", "tiny");
-//		usleep(200);
-//		MTR_END("main", "tiny");
-//		usleep(100);
-//	}
-//    MTR_END ("main", "tinyblock");
 //	MTR_STEP("background", "long_running", &long_running_thing_1, "middle step");
 //	usleep(80000);
 //	MTR_END("main", "outer");
@@ -830,7 +511,6 @@ void generate_trace_data() {
 }
 
 typedef struct gui_draw_data {
-	IntrvlTreeNode* interval_tree_root;
 	int is_processed;
 	int64_t ts_start;
 	int64_t ts_end;
@@ -838,28 +518,23 @@ typedef struct gui_draw_data {
 	double dur_generation;
 	double dur_processing;
 	double dur_intrvl_merge;
-	double dur_build_tree;
 	double dur_calc_depths;
 	int interval_count;
 } gui_draw_data;
 
-static struct gui_draw_data _draw_data = { NULL, 0, 0, 0};
+static struct gui_draw_data _draw_data = { 0, 0, 0, NULL, 0., 0., 0., 0 };
 
 void gui_draw_data_reset () {
 	if (draw_data == NULL) {
 		return;
 	}
 
-	AllocIntrvlDestroy ();
-
 	memset (draw_data, 0, sizeof (gui_draw_data));
-	draw_data->interval_tree_root = NULL;
 	draw_data->clicked_item = NULL;
 	draw_data->is_processed = 0.;
 	draw_data->dur_generation = 0.;
 	draw_data->dur_processing = 0.;
 	draw_data->dur_intrvl_merge = 0.;
-	draw_data->dur_build_tree = 0.;
 	draw_data->dur_calc_depths = 0.;
 	draw_data->interval_count = 0;
 }
@@ -867,6 +542,10 @@ void gui_draw_data_reset () {
 #define INTERVAL_SEARCH_BUFFER_SIZE 10000
 raw_event_t* intrvl_srch_buffer[INTERVAL_SEARCH_BUFFER_SIZE];
 int intrvl_srch_buf_idx = 0;
+
+int cmp_event_ts (const void* ev_a, const void *ev_b) {
+  return ((raw_event_t*) ev_a)->ts - ((raw_event_t*) ev_b)->ts;
+}
 
 void mtr_imgui_preprocess () {
 	if (draw_data == NULL) {
@@ -876,14 +555,13 @@ void mtr_imgui_preprocess () {
 	if (draw_data->is_processed)
 		return;
 
-	printf ("Starting processing of trace data...");
+	printf ("Starting processing of trace data...\n");
 	draw_data->dur_processing = mtr_time_s();
 
 	double ts_intrvl_merge_start = mtr_time_s();
 	intrvl_srch_buf_idx = -1;
 
 	// Preprocess: replace start (S,B) and end events (F,E) with complete events (X)
-	raw_event_t *start_event = NULL;
 	for (int i = 0; i < count; i++) {
 		raw_event_t *raw_i = &buffer[i];
 
@@ -903,43 +581,7 @@ void mtr_imgui_preprocess () {
 					break;
 				}
 			}
-		}
-
-
-#ifdef USE_SEARCH_BUFFER
-		if (raw->ph == 'S' || raw->ph == 'B') {
-			intrvl_srch_buffer[intrvl_srch_buf_idx++] = raw;
-			assert (intrvl_srch_buf_idx < INTERVAL_SEARCH_BUFFER_SIZE);
-
-			continue;
-		}
-
-		if (raw->ph == 'F' || raw->ph == 'E') {
-			for (int j = intrvl_srch_buf_idx - 1; j >= 0; j--) {
-				raw_event_t* raw_start_buf = intrvl_srch_buffer[j];
-
-				if (raw->name == raw_start_buf->name
-						&& raw->cat == raw_start_buf->cat
-						&& raw->id == raw_start_buf->id
-						&& raw->pid == raw_start_buf->pid
-						&& raw->tid == raw_start_buf->tid
-					 ) {
-					raw_start_buf->ph = 'X';
-					raw_start_buf->a_double = (raw->ts - raw_start_buf->ts);
-
-					// Invalidate the current one
-					raw->ph = '_';
-
-					// Remove start entry by swapping it with the last added
-					intrvl_srch_buffer[j] = intrvl_srch_buffer[intrvl_srch_buf_idx];
-					intrvl_srch_buffer[intrvl_srch_buf_idx] = NULL;
-					intrvl_srch_buf_idx--;
-
-					break;
-				}
-			}
-		}
-#endif
+	  }
 	}
 
 	draw_data->dur_intrvl_merge = mtr_time_s() - ts_intrvl_merge_start;
@@ -951,48 +593,70 @@ void mtr_imgui_preprocess () {
 		ts_start = buffer[0].ts;
 	}
 
-	double ts_build_tree = mtr_time_s();
-	// Sort events into the interval tree
 	for (int i = 0; i < count; i++) {
 		raw_event_t *raw = &buffer[i];
 
 		int64_t raw_end = raw->ts + (int) raw->a_double;
-		switch (raw->ph) {
-			case 'X': ts_start = ts_start > raw->ts ? raw->ts : ts_start;
-								ts_end = ts_end < raw_end ? raw_end: ts_end; break;
-								break;
-			default: break;
-		}
 
 		if (raw->ph == 'X') {
-#ifdef USE_AVL_TREE
-			draw_data->interval_tree_root = IntrvlTreeNodeAddEvent (draw_data->interval_tree_root, raw);
-#else
-			IntrvlTreeNodeAddEvent (&draw_data->interval_tree_root, raw);
-#endif
+		  // Update min/max values of the profiling horizon
+      ts_start = ts_start > raw->ts ? raw->ts : ts_start;
+      ts_end = ts_end < raw_end ? raw_end: ts_end;
+
 			draw_data->interval_count++;
 		}
 	}
-	draw_data->dur_build_tree = mtr_time_s() - ts_build_tree;
-
-	IntrvlTreeNodePrint (draw_data->interval_tree_root, ts_start);
 
 	// Compute the depth of the events
 	double ts_calc_depths = mtr_time_s();
-	for (int i = 0; i < count; i++) {
-		raw_event_t *raw = &buffer[i];
-		uint32_t row_index = CalcIntrvlDepth (raw, draw_data->interval_tree_root);
 
-		raw->pid = row_index;
-	}
-	draw_data->dur_calc_depths = mtr_time_s() - ts_calc_depths;
+	// Sort the data according
+	qsort (buffer, count, sizeof(raw_event_t), cmp_event_ts);
+
+  // Compute the depth of the events
+  int stack_height = 0;
+  raw_event_t* stack[MAX_STACK_SIZE];
+  stack[0] = NULL;
+  int64_t prev_ts = 0;
+  if (count > 0) {
+    prev_ts = buffer[0].ts;
+  }
+
+  for (int i = 0; i < count; i++) {
+    raw_event_t *raw = &buffer[i];
+    int64_t ts = raw->ts;
+    if (ts < prev_ts) {
+      fprintf (stderr, "Error: event timestamps not monotonous. Event %d timestamp %ld, event %d timestamp %ld\n", i, ts, i - 1, prev_ts);
+    }
+    prev_ts = ts;
+
+    while (stack_height > 0) {
+      raw_event_t* stack_top = stack[stack_height - 1];
+      int64_t event_end = stack_top->ts + (int) stack_top->a_double;
+
+      if (event_end <= ts) {
+        stack[stack_height - 1] = NULL;
+        stack_height--;
+      } else {
+        break;
+      }
+    }
+
+    if (raw->ph == 'X') {
+      stack[stack_height] = raw;
+      stack_height ++;
+      raw->pid = stack_height;
+    }
+  }
+
+  draw_data->dur_calc_depths = mtr_time_s() - ts_calc_depths;
 
 	draw_data->ts_start = ts_start;
 	draw_data->ts_end = ts_end;
 
 	draw_data->dur_processing = mtr_time_s() - draw_data->dur_processing;
 	draw_data->is_processed = 1;
-	printf ("Trace data processed!");
+	printf ("Trace data processed!\n");
 
 }
 
@@ -1014,12 +678,34 @@ void mtr_imgui_draw() {
 	if (ImGui::Button ("Flush Data")) {
 		mtr_flush();
 	}
-	bool reset_zoom = 0;
 	ImGui::SameLine();
 	if (ImGui::Button ("Reset Zoom")) {
-		reset_zoom = 1;
 		draw_data->clicked_item = NULL;
 	}
+  ImGui::SameLine();
+  if (ImGui::Button ("+")) {
+    draw_data->clicked_item = NULL;
+    int64_t start = draw_data->ts_start;
+    int64_t end = draw_data->ts_end;
+    int64_t range = end - start;
+    int64_t center = start + 0.5 * range;
+
+    range = range * 0.9;
+    draw_data->ts_start = center - 0.5 * range;
+    draw_data->ts_end = center + 0.5 * range;
+  }
+  ImGui::SameLine();
+  if (ImGui::Button ("-")) {
+    draw_data->clicked_item = NULL;
+    int64_t start = draw_data->ts_start;
+    int64_t end = draw_data->ts_end;
+    int64_t range = end - start;
+    int64_t center = start + 0.5 * range;
+
+    range = range * 1.1;
+    draw_data->ts_start = center - 0.5 * range;
+    draw_data->ts_end = center + 0.5 * range;
+  }
 
 	mtr_imgui_preprocess();
 
@@ -1031,11 +717,10 @@ void mtr_imgui_draw() {
 		ts_end = draw_data->clicked_item->ts + (int) draw_data->clicked_item->a_double;
 	}
 
-	ImGui::Text ("Start %ld end %ld duration %ld size %d clicked %p", 
+	ImGui::Text ("Start %ld end %ld duration %ld size %ld clicked %p",
 			ts_start, ts_end, 
 			ts_end - ts_start, count * sizeof(raw_event),
 			draw_data->clicked_item);
-	ImGui::Text ("Tree: depth %d", IntrvlTreeNodeDepth (draw_data->interval_tree_root));
 
 	// Content
 	float row_height = ImGui::GetTextLineHeight();
@@ -1048,7 +733,6 @@ void mtr_imgui_draw() {
 
 	float pixel_per_ns = (float) (size.x / (ts_end - ts_start));
 	ImDrawList* draw_list = ImGui::GetWindowDrawList();
-	int row_index = 0;
 
 	double dur_stats_render = mtr_time_s();
 	raw_event_t *hovered_item = NULL;
@@ -1063,7 +747,7 @@ void mtr_imgui_draw() {
 					|| width < 1.0f)
 				continue;
 
-			row_index = raw->pid;
+			int row_index = raw->pid;
 			const ImVec2 rect_start (position.x + (raw->ts - ts_start) * (pixel_per_ns), position.y + row_index * row_height);
 			const ImVec2 rect_end (position.x + (raw->ts + (int) raw->a_double - ts_start) * pixel_per_ns, position.y + (row_index + 1) * row_height);
 
@@ -1120,16 +804,14 @@ void mtr_imgui_draw() {
 				hovered_item->a_double * 1.0e-6,
 				(dur_sum / raw_count) * 1.0e-6, dur_min * 1.0e-6, dur_max * 1.0e-6);
 	}
-	ImGui::Text("Intervals %d\nGeneration %7.4f\nProcessing %7.4f\nMerge Intervals %7.4f\nBuild Tree %7.4f\nCalc Depths %7.4f\nRender %7.4f\nStats %7.4f\nNode Blocks %d\n", 
+	ImGui::Text("Intervals %d\nGeneration %7.4f\nProcessing %7.4f\nMerge Intervals %7.4f\nCalc Depths %7.4f\nRender %7.4f\nStats %7.4f\n",
 			draw_data->interval_count,
 			draw_data->dur_generation,
 			draw_data->dur_processing,
 			draw_data->dur_intrvl_merge,
-			draw_data->dur_build_tree,
 			draw_data->dur_calc_depths,
 			dur_stats_render,
-			(mtr_time_s() - ts_stats_start),
-			intrvl_tree_node_alloc_data.block_count);
+			(mtr_time_s() - ts_stats_start));
 
 	ImGui::EndChild(); // ProfilerWrapper
 
